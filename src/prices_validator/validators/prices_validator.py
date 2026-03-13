@@ -404,7 +404,6 @@ class PricesValidator:
         count_results = []
         row_level_results = []
 
-        # Paso 1: conteo rápido para todas las columnas
         columns_with_count_differences = []
 
         for col in common_cols:
@@ -429,7 +428,6 @@ class PricesValidator:
                     }
                 )
 
-        # Paso 2: row-level solo para columnas que ya mostraron diferencia
         if STRICT_BLANK_ROW_LEVEL_MODE and columns_with_count_differences and KEY_COLUMN in domo_df.columns and KEY_COLUMN in inf_df.columns:
             domo_unique = domo_df.drop_duplicates(subset=[KEY_COLUMN], keep="first").copy()
             inf_unique = inf_df.drop_duplicates(subset=[KEY_COLUMN], keep="first").copy()
@@ -548,7 +546,17 @@ class PricesValidator:
                     actual=f"Missing fields: {len(missing_fields)}",
                     details=", ".join(missing_fields),
                 )
+                print(f"      Missing fields -> {len(missing_fields)}")
                 continue
+
+            print(f"      Country fields to compare -> {len(fields)}")
+
+            country_mismatch_total = 0
+            country_structure_total = 0
+            country_code_diff_total = 0
+            country_code_issue_total = 0
+            cross_file_differences = 0
+            internal_alignment_observations = 0
 
             for field_name in fields:
                 mismatch_count = 0
@@ -574,7 +582,6 @@ class PricesValidator:
                                 }
                             )
 
-                    # En modo compare, las observaciones estructurales no deben bloquear equivalencia
                     inf_errors = self._parse_field_structure(field_name, inf_val, country)
                     domo_errors = self._parse_field_structure(field_name, domo_val, country) if STRICT_STRUCTURE_BOTH_SIDES_MODE else []
 
@@ -592,6 +599,9 @@ class PricesValidator:
                                     "informatica_value": inf_val,
                                 }
                             )
+
+                country_mismatch_total += mismatch_count
+                country_structure_total += structure_observations
 
                 status = "PASS" if mismatch_count == 0 else "FAIL"
                 category = "Country Content" if not any(field_name.startswith(prefix) for prefix in CODE_FIELD_PREFIXES) else "Country Codes"
@@ -654,6 +664,9 @@ class PricesValidator:
                             }
                         )
 
+            country_code_diff_total += code_diffs
+            country_code_issue_total += len(code_issues)
+
             if code_issues:
                 self.evidence[f"code_issues_{country}"] = pd.DataFrame(code_issues)
 
@@ -678,9 +691,6 @@ class PricesValidator:
             price_field = COUNTRY_FIELD_TEMPLATES["pos_sign_price"].format(country=country)
             eff_field = COUNTRY_FIELD_TEMPLATES["effective_date"].format(country=country)
             exp_field = COUNTRY_FIELD_TEMPLATES["expired_date"].format(country=country)
-
-            cross_file_differences = 0
-            internal_alignment_observations = 0
 
             for key in common_keys:
                 row_a = domo_rows[key]
@@ -737,6 +747,19 @@ class PricesValidator:
                                 "informatica_expired_stores": "|".join(inf_exp),
                             }
                         )
+
+            print(
+                f"      Field diffs -> {country_mismatch_total}, "
+                f"Structure observations -> {country_structure_total}"
+            )
+            print(
+                f"      Code diffs -> {country_code_diff_total}, "
+                f"Code observations -> {country_code_issue_total}"
+            )
+            print(
+                f"      Cross-field diffs -> {cross_file_differences}, "
+                f"Internal observations -> {internal_alignment_observations}"
+            )
 
             self.add_check(
                 f"PRICES-{country}-XFIELD",

@@ -1,8 +1,27 @@
+# Python
 __pycache__/
 *.pyc
+
+# Virtual env
 .venv/
+
+# Reports / outputs
 reports/
-prices-validator-base/
-domo_prices.csv
-informatica_prices.csv
+.streamlit_uploads/
+
+# Local test CSV files
+domo_*.csv
+informatica_*.csv
+DICT_*.csv
+SYSTEM_*.csv
+UPC*.csv
 *.xlsx
+*.zip
+
+# Old projects
+prices-validator-base/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

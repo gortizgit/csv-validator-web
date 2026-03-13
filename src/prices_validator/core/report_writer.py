@@ -15,37 +15,7 @@ def ensure_out_dir(out_dir: str) -> str:
 
 
 def _build_issue_explanations_df(checks_df: pd.DataFrame) -> pd.DataFrame:
-    if checks_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "check_id",
-                "status",
-                "check_name",
-                "country",
-                "field",
-                "actual",
-                "details",
-                "evidence_file",
-            ]
-        )
-
-    issues_df = checks_df[checks_df["status"].isin(["FAIL", "WARNING"])].copy()
-
-    if issues_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "check_id",
-                "status",
-                "check_name",
-                "country",
-                "field",
-                "actual",
-                "details",
-                "evidence_file",
-            ]
-        )
-
-    wanted_columns = [
+    base_columns = [
         "check_id",
         "status",
         "check_name",
@@ -56,11 +26,30 @@ def _build_issue_explanations_df(checks_df: pd.DataFrame) -> pd.DataFrame:
         "evidence_file",
     ]
 
-    for col in wanted_columns:
+    if checks_df.empty:
+        return pd.DataFrame(columns=base_columns)
+
+    issues_df = checks_df[checks_df["status"].isin(["FAIL", "WARNING"])].copy()
+
+    if issues_df.empty:
+        return pd.DataFrame(columns=base_columns)
+
+    for col in base_columns:
         if col not in issues_df.columns:
             issues_df[col] = ""
 
-    return issues_df[wanted_columns]
+    return issues_df[base_columns]
+
+
+def _get_report_title(run: ValidationRun) -> str:
+    dataset_name = ""
+    if isinstance(run.summary, dict):
+        dataset_name = str(run.summary.get("dataset", "")).strip()
+
+    if not dataset_name:
+        dataset_name = "Dataset"
+
+    return f"{dataset_name} Validation Report"
 
 
 def write_reports(run: ValidationRun, out_dir: str) -> Dict[str, str]:
@@ -74,9 +63,11 @@ def write_reports(run: ValidationRun, out_dir: str) -> Dict[str, str]:
     issue_explanations_csv = os.path.join(out_dir, "issue_explanations.csv")
     issues_df.to_csv(issue_explanations_csv, index=False)
 
+    report_title = _get_report_title(run)
+
     summary_md = os.path.join(out_dir, "summary.md")
     with open(summary_md, "w", encoding="utf-8") as fh:
-        fh.write("# Prices Validation Report\n\n")
+        fh.write(f"# {report_title}\n\n")
         fh.write(f"Generated: {datetime.now().isoformat(timespec='seconds')}\n\n")
 
         for key, value in run.summary.items():
@@ -132,5 +123,4 @@ def write_reports(run: ValidationRun, out_dir: str) -> Dict[str, str]:
             df.to_excel(writer, sheet_name=safe_name, index=False)
 
     evidence_paths["excel"] = excel_path
-
     return evidence_paths

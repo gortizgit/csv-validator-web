@@ -20,12 +20,31 @@ from prices_validator.core.csv_loader import load_csv_raw
 from prices_validator.core.report_writer import write_reports
 from prices_validator.core.types import SnapshotContext
 from prices_validator.validators.prices_validator import PricesValidator
+from products_validator.validators.products_validator import ProductsValidator
+from currencies_validator.validators.currencies_validator import CurrenciesValidator
 
 APP_TITLE = "CSV Validation Workbench"
 REPORTS_DIR = ROOT / "reports"
 TMP_UPLOAD_DIR = ROOT / ".streamlit_uploads"
 
 DATASETS = ["Prices", "Products", "UPS", "Currencies", "Memberships"]
+
+
+class StreamlitLogCapture:
+    def __init__(self, placeholder) -> None:
+        self.placeholder = placeholder
+        self.buffer = io.StringIO()
+
+    def write(self, text: str) -> int:
+        self.buffer.write(text)
+        self.placeholder.code(self.buffer.getvalue(), language="text")
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def get_value(self) -> str:
+        return self.buffer.getvalue()
 
 
 def ensure_dir(path: Path) -> Path:
@@ -60,7 +79,7 @@ def build_run_name(dataset_name: str) -> str:
 
 
 def dataset_supported(dataset_name: str) -> bool:
-    return dataset_name == "Prices"
+    return dataset_name in {"Prices", "Products", "Currencies"}
 
 
 def render_dataset_help(dataset_name: str) -> None:
@@ -68,6 +87,18 @@ def render_dataset_help(dataset_name: str) -> None:
         st.info(
             "Prices validator is active. It supports schema, record count, key population, "
             "blank/whitespace behavior, country-level validation, cross-field alignment, "
+            "Excel report, issue explanations, and ZIP export."
+        )
+    elif dataset_name == "Products":
+        st.info(
+            "Products validator is active. It supports schema, record count, key population, "
+            "mandatory fields, UPC / Quick Lookup, country-level validation, cross-field checks, "
+            "Excel report, issue explanations, and ZIP export."
+        )
+    elif dataset_name == "Currencies":
+        st.info(
+            "Currencies validator is active. It supports schema, approved comparison universe, "
+            "Current + Last Year row count, key population, quality observations, "
             "Excel report, issue explanations, and ZIP export."
         )
     else:
@@ -110,6 +141,122 @@ def run_prices_validation(
     print("Reports generated successfully.")
 
     return evidence_paths
+
+
+def run_products_validation(
+    domo_path: Path,
+    inf_path: Path,
+    delimiter: str,
+    encoding: str,
+    run_dir: Path,
+    domo_snapshot: str,
+    inf_snapshot: str,
+) -> Dict[str, str]:
+    print("Loading DOMO CSV...")
+    domo_df = load_csv_raw(str(domo_path), delimiter=delimiter, encoding=encoding)
+    print(f"DOMO loaded: rows={len(domo_df):,}, columns={len(domo_df.columns):,}")
+
+    print("Loading INFORMATICA CSV...")
+    inf_df = load_csv_raw(str(inf_path), delimiter=delimiter, encoding=encoding)
+    print(f"INFORMATICA loaded: rows={len(inf_df):,}, columns={len(inf_df.columns):,}")
+
+    print("Initializing Products validator...")
+    validator = ProductsValidator(
+        snapshot_context=SnapshotContext(
+            domo_snapshot=domo_snapshot.strip(),
+            informatica_snapshot=inf_snapshot.strip(),
+        )
+    )
+
+    print("Running Products validation...")
+    run = validator.validate(domo_df, inf_df)
+
+    print("Writing reports...")
+    evidence_paths = write_reports(run, str(run_dir))
+    print("Reports generated successfully.")
+
+    return evidence_paths
+
+
+def run_currencies_validation(
+    domo_path: Path,
+    inf_path: Path,
+    delimiter: str,
+    encoding: str,
+    run_dir: Path,
+    domo_snapshot: str,
+    inf_snapshot: str,
+) -> Dict[str, str]:
+    print("Loading DOMO CSV...")
+    domo_df = load_csv_raw(str(domo_path), delimiter=delimiter, encoding=encoding)
+    print(f"DOMO loaded: rows={len(domo_df):,}, columns={len(domo_df.columns):,}")
+
+    print("Loading INFORMATICA CSV...")
+    inf_df = load_csv_raw(str(inf_path), delimiter=delimiter, encoding=encoding)
+    print(f"INFORMATICA loaded: rows={len(inf_df):,}, columns={len(inf_df.columns):,}")
+
+    print("Initializing Currencies validator...")
+    validator = CurrenciesValidator(
+        snapshot_context=SnapshotContext(
+            domo_snapshot=domo_snapshot.strip(),
+            informatica_snapshot=inf_snapshot.strip(),
+        )
+    )
+
+    print("Running Currencies validation...")
+    run = validator.validate(domo_df, inf_df)
+
+    print("Writing reports...")
+    evidence_paths = write_reports(run, str(run_dir))
+    print("Reports generated successfully.")
+
+    return evidence_paths
+
+
+def run_selected_validation(
+    dataset_name: str,
+    domo_path: Path,
+    inf_path: Path,
+    delimiter: str,
+    encoding: str,
+    run_dir: Path,
+    domo_snapshot: str,
+    inf_snapshot: str,
+) -> Dict[str, str]:
+    if dataset_name == "Prices":
+        return run_prices_validation(
+            domo_path=domo_path,
+            inf_path=inf_path,
+            delimiter=delimiter,
+            encoding=encoding,
+            run_dir=run_dir,
+            domo_snapshot=domo_snapshot,
+            inf_snapshot=inf_snapshot,
+        )
+
+    if dataset_name == "Products":
+        return run_products_validation(
+            domo_path=domo_path,
+            inf_path=inf_path,
+            delimiter=delimiter,
+            encoding=encoding,
+            run_dir=run_dir,
+            domo_snapshot=domo_snapshot,
+            inf_snapshot=inf_snapshot,
+        )
+
+    if dataset_name == "Currencies":
+        return run_currencies_validation(
+            domo_path=domo_path,
+            inf_path=inf_path,
+            delimiter=delimiter,
+            encoding=encoding,
+            run_dir=run_dir,
+            domo_snapshot=domo_snapshot,
+            inf_snapshot=inf_snapshot,
+        )
+
+    raise ValueError(f"Dataset not supported yet: {dataset_name}")
 
 
 def show_file_downloads(evidence_paths: Dict[str, str], run_dir: Path) -> None:
@@ -186,13 +333,13 @@ def render_run_outputs(evidence_paths: Dict[str, str]) -> None:
     if checks_path.exists():
         st.subheader("Checks")
         checks_df = pd.read_csv(checks_path)
-        st.dataframe(checks_df, use_container_width=True, height=420)
+        st.dataframe(checks_df, width="stretch", height=420)
 
     if issues_path.exists():
         issues_df = pd.read_csv(issues_path)
         if not issues_df.empty:
             st.subheader("Warnings / Failures Explained")
-            st.dataframe(issues_df, use_container_width=True, height=260)
+            st.dataframe(issues_df, width="stretch", height=260)
 
 
 def init_session_state() -> None:
@@ -227,7 +374,7 @@ def main() -> None:
         st.title(APP_TITLE)
         st.caption("Multi-dataset validation console for DOMO / Informatica style comparisons")
     with top_right:
-        if st.button("New Validation", use_container_width=True):
+        if st.button("New Validation", width="stretch"):
             clear_validation_state()
             st.rerun()
 
@@ -273,7 +420,10 @@ def main() -> None:
 
     if validate_clicked:
         if not dataset_supported(selected_dataset):
-            st.session_state["last_status"] = ("error", f"{selected_dataset} validator is not implemented yet.")
+            st.session_state["last_status"] = (
+                "error",
+                f"{selected_dataset} validator is not implemented yet.",
+            )
             st.rerun()
 
         if not domo_file or not inf_file:
@@ -287,12 +437,15 @@ def main() -> None:
         domo_path = save_uploaded_file(domo_file, upload_dir / domo_file.name)
         inf_path = save_uploaded_file(inf_file, upload_dir / inf_file.name)
 
-        log_buffer = io.StringIO()
         evidence_paths: Optional[Dict[str, str]] = None
+
+        st.subheader("Execution Log")
+        live_log_placeholder = st.empty()
+        log_capture = StreamlitLogCapture(live_log_placeholder)
 
         with st.spinner("Validating... large files may take time"):
             try:
-                with redirect_stdout(log_buffer):
+                with redirect_stdout(log_capture):
                     print("===================================")
                     print("VALIDATION WORKBENCH START")
                     print("===================================")
@@ -302,7 +455,8 @@ def main() -> None:
                     print(f"Run folder: {run_dir}")
                     print("-----------------------------------")
 
-                    evidence_paths = run_prices_validation(
+                    evidence_paths = run_selected_validation(
+                        dataset_name=selected_dataset,
                         domo_path=domo_path,
                         inf_path=inf_path,
                         delimiter=delimiter,
@@ -317,18 +471,20 @@ def main() -> None:
 
                 st.session_state["last_evidence_paths"] = evidence_paths
                 st.session_state["last_run_dir"] = str(run_dir)
-                st.session_state["last_log_text"] = log_buffer.getvalue()
+                st.session_state["last_log_text"] = log_capture.get_value()
                 st.session_state["last_status"] = ("success", "Validation completed successfully.")
 
             except Exception as exc:
-                print("-----------------------------------", file=log_buffer)
-                print("Validation failed", file=log_buffer)
-                print(type(exc).__name__, file=log_buffer)
-                print(str(exc), file=log_buffer)
+                print("-----------------------------------", file=log_capture.buffer)
+                print("Validation failed", file=log_capture.buffer)
+                print(type(exc).__name__, file=log_capture.buffer)
+                print(str(exc), file=log_capture.buffer)
+
+                live_log_placeholder.code(log_capture.get_value(), language="text")
 
                 st.session_state["last_evidence_paths"] = None
                 st.session_state["last_run_dir"] = None
-                st.session_state["last_log_text"] = log_buffer.getvalue()
+                st.session_state["last_log_text"] = log_capture.get_value()
                 st.session_state["last_status"] = ("error", f"Validation failed: {exc}")
 
         st.rerun()
@@ -359,9 +515,9 @@ def main() -> None:
     st.markdown(
         """
         - Prices ✅  
-        - Products ⏳  
+        - Products ✅  
         - UPS ⏳  
-        - Currencies ⏳  
+        - Currencies ✅  
         - Memberships ⏳
         """
     )
