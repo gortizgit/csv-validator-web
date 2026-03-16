@@ -25,3 +25,15 @@ prices-validator-base/
 .DS_Store
 Thumbs.db
 .vscode/
+
+
+# Old projects
+prices-validator-base/
+
+# Membership test files
+Membership/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

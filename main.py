@@ -16,17 +16,33 @@ from prices_validator.core.types import SnapshotContext
 from prices_validator.validators.prices_validator import PricesValidator
 from products_validator.validators.products_validator import ProductsValidator
 from currencies_validator.validators.currencies_validator import CurrenciesValidator
+from upc_validator.validators.upc_validator import UpcValidator
+from memberships_validator.validators.memberships_daily_maintenance_validator import (
+    MembershipsDailyMaintenanceValidator,
+)
+from memberships_validator.validators.memberships_delta_validator import (
+    MembershipsDeltaValidator,
+)
+from memberships_validator.validators.memberships_full_import_validator import (
+    MembershipsFullImportValidator,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="CSV validator for Prices / Products / Currencies"
+        description="CSV validator for Prices / Products / UPC / Currencies / Memberships"
     )
     parser.add_argument(
         "--dataset",
         required=True,
-        choices=["Prices", "Products", "Currencies"],
+        choices=["Prices", "Products", "UPC", "Currencies", "Memberships"],
         help="Dataset to validate",
+    )
+    parser.add_argument(
+        "--memberships-mode",
+        default="Daily Maintenance",
+        choices=["Daily Maintenance", "Delta", "Full Import"],
+        help="Memberships mode when dataset=Memberships",
     )
     parser.add_argument("--domo", required=True, help="Path to Domo CSV")
     parser.add_argument("--informatica", required=True, help="Path to Informatica CSV")
@@ -47,12 +63,18 @@ def main() -> None:
 
     start_time = time.time()
 
+    effective_dataset_name = args.dataset
+    if args.dataset == "Memberships":
+        effective_dataset_name = f"{args.dataset} - {args.memberships_mode}"
+
     print("===================================")
-    print(f"{args.dataset.upper()} VALIDATOR START")
+    print(f"{effective_dataset_name.upper()} VALIDATOR START")
     print("===================================")
     print(f"DOMO file: {args.domo}")
     print(f"INFORMATICA file: {args.informatica}")
     print(f"Output folder: {args.out}")
+    if args.dataset == "Memberships":
+        print(f"Memberships mode: {args.memberships_mode}")
     print("-----------------------------------")
 
     print("Loading DOMO CSV...")
@@ -83,8 +105,19 @@ def main() -> None:
         validator = PricesValidator(snapshot_context=snapshot_context)
     elif args.dataset == "Products":
         validator = ProductsValidator(snapshot_context=snapshot_context)
-    else:
+    elif args.dataset == "Currencies":
         validator = CurrenciesValidator(snapshot_context=snapshot_context)
+    elif args.dataset == "UPC":
+        validator = UpcValidator(snapshot_context=snapshot_context)
+    elif args.dataset == "Memberships":
+        if args.memberships_mode == "Daily Maintenance":
+            validator = MembershipsDailyMaintenanceValidator(snapshot_context=snapshot_context)
+        elif args.memberships_mode == "Delta":
+            validator = MembershipsDeltaValidator(snapshot_context=snapshot_context)
+        else:
+            validator = MembershipsFullImportValidator(snapshot_context=snapshot_context)
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
 
     print("Validator initialized")
     print("-----------------------------------")

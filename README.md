@@ -49,3 +49,15 @@ The validator produces:
 - `check_results.csv`
 - `validation_report.xlsx`
 - evidence CSV files for mismatches and structural issues
+
+# CSV files
+*.csv
+
+# Membership test data
+Membership/
+
+# Upload temp
+.streamlit_uploads/
+
+# Reports
+reports/

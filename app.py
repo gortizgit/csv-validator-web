@@ -22,12 +22,23 @@ from prices_validator.core.types import SnapshotContext
 from prices_validator.validators.prices_validator import PricesValidator
 from products_validator.validators.products_validator import ProductsValidator
 from currencies_validator.validators.currencies_validator import CurrenciesValidator
+from upc_validator.validators.upc_validator import UpcValidator
+from memberships_validator.validators.memberships_daily_maintenance_validator import (
+    MembershipsDailyMaintenanceValidator,
+)
+from memberships_validator.validators.memberships_delta_validator import (
+    MembershipsDeltaValidator,
+)
+from memberships_validator.validators.memberships_full_import_validator import (
+    MembershipsFullImportValidator,
+)
 
 APP_TITLE = "CSV Validation Workbench"
 REPORTS_DIR = ROOT / "reports"
 TMP_UPLOAD_DIR = ROOT / ".streamlit_uploads"
 
-DATASETS = ["Prices", "Products", "UPS", "Currencies", "Memberships"]
+DATASETS = ["Prices", "Products", "UPC", "Currencies", "Memberships"]
+MEMBERSHIPS_MODES = ["Daily Maintenance", "Delta", "Full Import"]
 
 
 class StreamlitLogCapture:
@@ -78,11 +89,46 @@ def build_run_name(dataset_name: str) -> str:
     return f"{dataset_name.lower()}_run_{ts}"
 
 
+def build_effective_run_dataset_name(dataset_name: str, memberships_mode: str | None = None) -> str:
+    if dataset_name == "Memberships" and memberships_mode:
+        normalized_mode = memberships_mode.lower().replace(" ", "_")
+        return f"memberships_{normalized_mode}"
+    return dataset_name
+
+
+def normalize_dataset_run_prefix(dataset_name: str, memberships_mode: str | None = None) -> str:
+    return f"{build_effective_run_dataset_name(dataset_name, memberships_mode).lower()}_run_"
+
+
+def ensure_dataset_run_name(dataset_name: str, memberships_mode: str | None = None) -> None:
+    expected_prefix = normalize_dataset_run_prefix(dataset_name, memberships_mode)
+    previous_dataset = st.session_state.get("selected_dataset")
+    previous_mode = st.session_state.get("selected_memberships_mode")
+    current_run_name = st.session_state.get("run_name", "").strip()
+
+    dataset_changed = previous_dataset != dataset_name
+    memberships_mode_changed = dataset_name == "Memberships" and previous_mode != memberships_mode
+
+    if "run_name" not in st.session_state or not current_run_name:
+        st.session_state["run_name"] = build_run_name(build_effective_run_dataset_name(dataset_name, memberships_mode))
+    elif dataset_changed or memberships_mode_changed:
+        st.session_state["run_name"] = build_run_name(build_effective_run_dataset_name(dataset_name, memberships_mode))
+    elif not current_run_name.startswith(expected_prefix):
+        st.session_state["run_name"] = build_run_name(build_effective_run_dataset_name(dataset_name, memberships_mode))
+
+    st.session_state["selected_dataset"] = dataset_name
+    st.session_state["selected_memberships_mode"] = memberships_mode
+
+
+def get_memberships_modes() -> list[str]:
+    return MEMBERSHIPS_MODES
+
+
 def dataset_supported(dataset_name: str) -> bool:
-    return dataset_name in {"Prices", "Products", "Currencies"}
+    return dataset_name in {"Prices", "Products", "UPC", "Currencies", "Memberships"}
 
 
-def render_dataset_help(dataset_name: str) -> None:
+def render_dataset_help(dataset_name: str, memberships_mode: str | None = None) -> None:
     if dataset_name == "Prices":
         st.info(
             "Prices validator is active. It supports schema, record count, key population, "
@@ -95,12 +141,43 @@ def render_dataset_help(dataset_name: str) -> None:
             "mandatory fields, UPC / Quick Lookup, country-level validation, cross-field checks, "
             "Excel report, issue explanations, and ZIP export."
         )
+    elif dataset_name == "UPC":
+        st.info(
+            "UPC validator is active. It supports strict schema, empty-file validation, record count, "
+            "UPC_Code / Item_Number population, duplicate behavior, null / blank validation, "
+            "whitespace checks, timestamp range validation, full row reconciliation, "
+            "Excel report, issue explanations, and ZIP export."
+        )
     elif dataset_name == "Currencies":
         st.info(
             "Currencies validator is active. It supports schema, approved comparison universe, "
             "Current + Last Year row count, key population, quality observations, "
             "Excel report, issue explanations, and ZIP export."
         )
+    elif dataset_name == "Memberships":
+        if memberships_mode == "Daily Maintenance":
+            st.info(
+                "Memberships Daily Maintenance validator is active. It validates the daily changed-memberships "
+                "universe, strict schema, country scope, key reconciliation, null / blank behavior, date / "
+                "boolean quality checks, full row reconciliation, issue explanations, and ZIP export."
+            )
+        elif memberships_mode == "Delta":
+            st.info(
+                "Memberships Delta validator is active. It validates the short-window delta contract, strict schema, "
+                "Timestamp_Run behavior, key reconciliation, country scope, null / blank checks, date / boolean "
+                "quality checks, full row reconciliation, issue explanations, and ZIP export."
+            )
+        elif memberships_mode == "Full Import":
+            st.info(
+                "Memberships Full Import validator is active. It validates the complete all-countries membership "
+                "universe with strict schema, country scope, key reconciliation, null / blank behavior, date / "
+                "boolean quality checks, full row reconciliation, issue explanations, and ZIP export."
+            )
+        else:
+            st.info(
+                "Memberships validator is active. Select a memberships mode to validate Full Import, "
+                "Daily Maintenance, or Delta data separately."
+            )
     else:
         st.warning(
             f"{dataset_name} is not implemented yet. "
@@ -178,6 +255,41 @@ def run_products_validation(
     return evidence_paths
 
 
+def run_upc_validation(
+    domo_path: Path,
+    inf_path: Path,
+    delimiter: str,
+    encoding: str,
+    run_dir: Path,
+    domo_snapshot: str,
+    inf_snapshot: str,
+) -> Dict[str, str]:
+    print("Loading DOMO CSV...")
+    domo_df = load_csv_raw(str(domo_path), delimiter=delimiter, encoding=encoding)
+    print(f"DOMO loaded: rows={len(domo_df):,}, columns={len(domo_df.columns):,}")
+
+    print("Loading INFORMATICA CSV...")
+    inf_df = load_csv_raw(str(inf_path), delimiter=delimiter, encoding=encoding)
+    print(f"INFORMATICA loaded: rows={len(inf_df):,}, columns={len(inf_df.columns):,}")
+
+    print("Initializing UPC validator...")
+    validator = UpcValidator(
+        snapshot_context=SnapshotContext(
+            domo_snapshot=domo_snapshot.strip(),
+            informatica_snapshot=inf_snapshot.strip(),
+        )
+    )
+
+    print("Running UPC validation...")
+    run = validator.validate(domo_df, inf_df)
+
+    print("Writing reports...")
+    evidence_paths = write_reports(run, str(run_dir))
+    print("Reports generated successfully.")
+
+    return evidence_paths
+
+
 def run_currencies_validation(
     domo_path: Path,
     inf_path: Path,
@@ -213,6 +325,47 @@ def run_currencies_validation(
     return evidence_paths
 
 
+def run_memberships_validation(
+    memberships_mode: str,
+    domo_path: Path,
+    inf_path: Path,
+    delimiter: str,
+    encoding: str,
+    run_dir: Path,
+    domo_snapshot: str,
+    inf_snapshot: str,
+) -> Dict[str, str]:
+    print("Loading DOMO CSV...")
+    domo_df = load_csv_raw(str(domo_path), delimiter=delimiter, encoding=encoding)
+    print(f"DOMO loaded: rows={len(domo_df):,}, columns={len(domo_df.columns):,}")
+
+    print("Loading INFORMATICA CSV...")
+    inf_df = load_csv_raw(str(inf_path), delimiter=delimiter, encoding=encoding)
+    print(f"INFORMATICA loaded: rows={len(inf_df):,}, columns={len(inf_df.columns):,}")
+
+    snapshot_context = SnapshotContext(
+        domo_snapshot=domo_snapshot.strip(),
+        informatica_snapshot=inf_snapshot.strip(),
+    )
+
+    print(f"Initializing Memberships validator ({memberships_mode})...")
+    if memberships_mode == "Daily Maintenance":
+        validator = MembershipsDailyMaintenanceValidator(snapshot_context=snapshot_context)
+    elif memberships_mode == "Delta":
+        validator = MembershipsDeltaValidator(snapshot_context=snapshot_context)
+    else:
+        validator = MembershipsFullImportValidator(snapshot_context=snapshot_context)
+
+    print(f"Running Memberships validation ({memberships_mode})...")
+    run = validator.validate(domo_df, inf_df)
+
+    print("Writing reports...")
+    evidence_paths = write_reports(run, str(run_dir))
+    print("Reports generated successfully.")
+
+    return evidence_paths
+
+
 def run_selected_validation(
     dataset_name: str,
     domo_path: Path,
@@ -222,6 +375,7 @@ def run_selected_validation(
     run_dir: Path,
     domo_snapshot: str,
     inf_snapshot: str,
+    memberships_mode: str | None = None,
 ) -> Dict[str, str]:
     if dataset_name == "Prices":
         return run_prices_validation(
@@ -245,8 +399,31 @@ def run_selected_validation(
             inf_snapshot=inf_snapshot,
         )
 
+    if dataset_name == "UPC":
+        return run_upc_validation(
+            domo_path=domo_path,
+            inf_path=inf_path,
+            delimiter=delimiter,
+            encoding=encoding,
+            run_dir=run_dir,
+            domo_snapshot=domo_snapshot,
+            inf_snapshot=inf_snapshot,
+        )
+
     if dataset_name == "Currencies":
         return run_currencies_validation(
+            domo_path=domo_path,
+            inf_path=inf_path,
+            delimiter=delimiter,
+            encoding=encoding,
+            run_dir=run_dir,
+            domo_snapshot=domo_snapshot,
+            inf_snapshot=inf_snapshot,
+        )
+
+    if dataset_name == "Memberships":
+        return run_memberships_validation(
+            memberships_mode=memberships_mode or "Daily Maintenance",
             domo_path=domo_path,
             inf_path=inf_path,
             delimiter=delimiter,
@@ -349,6 +526,9 @@ def init_session_state() -> None:
         "last_log_text": "",
         "last_status": None,
         "validation_counter": 0,
+        "selected_dataset": "Prices",
+        "selected_memberships_mode": "Daily Maintenance",
+        "run_name": build_run_name("Prices"),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -361,6 +541,12 @@ def clear_validation_state() -> None:
     st.session_state["last_log_text"] = ""
     st.session_state["last_status"] = None
     st.session_state["validation_counter"] = st.session_state.get("validation_counter", 0) + 1
+
+    current_dataset = st.session_state.get("selected_dataset", "Prices")
+    current_memberships_mode = st.session_state.get("selected_memberships_mode", "Daily Maintenance")
+    st.session_state["run_name"] = build_run_name(
+        build_effective_run_dataset_name(current_dataset, current_memberships_mode)
+    )
 
 
 def main() -> None:
@@ -381,24 +567,79 @@ def main() -> None:
     with st.sidebar:
         st.header("Validation Setup")
 
-        selected_dataset = st.selectbox("Dataset", DATASETS, index=0)
+        current_dataset = st.session_state.get("selected_dataset", "Prices")
+        selected_dataset = st.selectbox(
+            "Dataset",
+            DATASETS,
+            index=DATASETS.index(current_dataset) if current_dataset in DATASETS else 0,
+        )
+
+        memberships_mode = None
+        if selected_dataset == "Memberships":
+            current_memberships_mode = st.session_state.get("selected_memberships_mode", "Daily Maintenance")
+            memberships_mode = st.selectbox(
+                "Membership mode",
+                get_memberships_modes(),
+                index=get_memberships_modes().index(current_memberships_mode)
+                if current_memberships_mode in get_memberships_modes()
+                else 0,
+            )
+
+        ensure_dataset_run_name(selected_dataset, memberships_mode)
+
         delimiter = st.text_input("Delimiter", value=",")
         encoding = st.text_input("Encoding", value="utf-8")
-        run_name = st.text_input("Run name", value=build_run_name(selected_dataset))
+        run_name = st.text_input("Run name", key="run_name")
 
         st.markdown("---")
         st.subheader("Optional snapshot values")
-        domo_snapshot = st.text_input("DOMO snapshot / comparison window", value="")
-        inf_snapshot = st.text_input("Informatica snapshot / comparison window", value="")
+
+        domo_snapshot = st.text_input(
+            "DOMO snapshot / comparison window",
+            value="",
+            help=(
+                "Optional. Use this field to record the business snapshot, extraction date, "
+                "approved comparison window, or file version used to generate the DOMO CSV.\n\n"
+                "Examples:\n"
+                "- 2026-03-15\n"
+                "- 2026-03-15_0800\n"
+                "- approved_window_week_11\n"
+                "- master_file_delta_20260315"
+            ),
+            placeholder="Example: 2026-03-15 or master_file_delta_20260315",
+        )
+
+        inf_snapshot = st.text_input(
+            "Informatica snapshot / comparison window",
+            value="",
+            help=(
+                "Optional. Use this field to record the business snapshot, extraction date, "
+                "approved comparison window, or file version used to generate the Informatica CSV.\n\n"
+                "Normally it should match the DOMO snapshot value.\n\n"
+                "Examples:\n"
+                "- 2026-03-15\n"
+                "- 2026-03-15_0800\n"
+                "- approved_window_week_11\n"
+                "- master_file_delta_20260315"
+            ),
+            placeholder="Example: 2026-03-15 or master_file_delta_20260315",
+        )
 
         st.markdown("---")
         st.subheader("About this run")
-        render_dataset_help(selected_dataset)
+        render_dataset_help(selected_dataset, memberships_mode)
 
-    st.subheader(f"{selected_dataset} Validation")
+    page_title = selected_dataset
+    if selected_dataset == "Memberships" and memberships_mode:
+        page_title = f"{selected_dataset} - {memberships_mode}"
+
+    st.subheader(f"{page_title} Validation")
     st.info("Large CSV files may take 1–5 minutes depending on file size and validation depth.")
 
     uploader_key_suffix = st.session_state["validation_counter"]
+    effective_uploader_key = selected_dataset
+    if selected_dataset == "Memberships" and memberships_mode:
+        effective_uploader_key = f"{selected_dataset}_{memberships_mode.replace(' ', '_')}"
 
     left, right = st.columns(2)
 
@@ -406,14 +647,14 @@ def main() -> None:
         domo_file = st.file_uploader(
             "Upload DOMO CSV",
             type=["csv"],
-            key=f"{selected_dataset}_domo_{uploader_key_suffix}",
+            key=f"{effective_uploader_key}_domo_{uploader_key_suffix}",
         )
 
     with right:
         inf_file = st.file_uploader(
             "Upload Informatica CSV",
             type=["csv"],
-            key=f"{selected_dataset}_inf_{uploader_key_suffix}",
+            key=f"{effective_uploader_key}_inf_{uploader_key_suffix}",
         )
 
     validate_clicked = st.button("Validate", type="primary")
@@ -430,7 +671,9 @@ def main() -> None:
             st.session_state["last_status"] = ("error", "Please upload both files.")
             st.rerun()
 
-        safe_run_name = run_name.strip() or build_run_name(selected_dataset)
+        effective_run_name_seed = build_effective_run_dataset_name(selected_dataset, memberships_mode)
+        safe_run_name = run_name.strip() or build_run_name(effective_run_name_seed)
+
         run_dir = ensure_dir(REPORTS_DIR / safe_run_name)
         upload_dir = ensure_dir(TMP_UPLOAD_DIR / safe_run_name)
 
@@ -450,6 +693,8 @@ def main() -> None:
                     print("VALIDATION WORKBENCH START")
                     print("===================================")
                     print(f"Dataset: {selected_dataset}")
+                    if selected_dataset == "Memberships" and memberships_mode:
+                        print(f"Membership mode: {memberships_mode}")
                     print(f"DOMO file: {domo_path}")
                     print(f"Informatica file: {inf_path}")
                     print(f"Run folder: {run_dir}")
@@ -464,6 +709,7 @@ def main() -> None:
                         run_dir=run_dir,
                         domo_snapshot=domo_snapshot,
                         inf_snapshot=inf_snapshot,
+                        memberships_mode=memberships_mode,
                     )
 
                     print("-----------------------------------")
@@ -516,9 +762,9 @@ def main() -> None:
         """
         - Prices ✅  
         - Products ✅  
-        - UPS ⏳  
+        - UPC ✅  
         - Currencies ✅  
-        - Memberships ⏳
+        - Memberships ✅
         """
     )
 
