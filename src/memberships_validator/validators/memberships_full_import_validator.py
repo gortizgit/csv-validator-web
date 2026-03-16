@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from memberships_validator.validators.memberships_daily_maintenance_validator import MembershipsDailyMaintenanceValidator
-from memberships_validator.config.memberships_full_import_config import MODE_NAME, DATASET_NAME
+from memberships_validator.validators.memberships_daily_maintenance_validator import (
+    MembershipsDailyMaintenanceValidator,
+)
+from memberships_validator.config.memberships_full_import_config import (
+    DATASET_NAME,
+    MODE_NAME,
+)
 
 
 class MembershipsFullImportValidator(MembershipsDailyMaintenanceValidator):
