@@ -44,7 +44,6 @@ def ensure_out_dir(out_dir: str) -> str:
 
 
 def format_country_value(country_value: object) -> str:
-
     if country_value is None:
         return ""
 
@@ -56,13 +55,28 @@ def format_country_value(country_value: object) -> str:
     return COUNTRY_CODE_MAP.get(value, value)
 
 
+def _ensure_membership_number_column(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame(columns=["Membership_Number"])
+
+    if df.empty:
+        if "Membership_Number" not in df.columns:
+            df = df.copy()
+            df.insert(0, "Membership_Number", "")
+        return df
+
+    if "Membership_Number" not in df.columns:
+        df = df.copy()
+        df.insert(0, "Membership_Number", "")
+
+    return df
+
+
 # ✅ FIX AQUI — country se convierte antes de escribir reportes
 def _checks_to_dataframe(checks: List[CheckResult]) -> pd.DataFrame:
-
     rows = []
 
     for c in checks:
-
         country_str = format_country_value(c.country)
 
         rows.append(
@@ -100,7 +114,6 @@ def _checks_to_dataframe(checks: List[CheckResult]) -> pd.DataFrame:
 
 
 def _build_issue_explanations_df(checks_df: pd.DataFrame) -> pd.DataFrame:
-
     expected_columns = [
         "check_id",
         "status",
@@ -127,7 +140,6 @@ def _build_issue_explanations_df(checks_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=expected_columns)
 
     def build_explanation(row):
-
         status = str(row.get("status", "")).strip().upper()
         check_name = str(row.get("check_name", "")).strip()
         field = str(row.get("field", "")).strip()
@@ -162,7 +174,6 @@ def _build_issue_explanations_df(checks_df: pd.DataFrame) -> pd.DataFrame:
         return " ".join(parts)
 
     def build_recommended_action(row):
-
         status = str(row.get("status", "")).strip().upper()
         category = str(row.get("category", "")).strip().lower()
         field = str(row.get("field", "")).strip()
@@ -201,7 +212,6 @@ def _build_issue_explanations_df(checks_df: pd.DataFrame) -> pd.DataFrame:
         return ". ".join(actions)
 
     def build_priority(row):
-
         status = str(row.get("status", "")).upper()
         category = str(row.get("category", "")).lower()
 
@@ -232,7 +242,6 @@ def _build_summary_markdown(
     checks_df: pd.DataFrame,
     issues_df: pd.DataFrame,
 ) -> str:
-
     summary = run.summary or {}
 
     total_checks = len(checks_df.index)
@@ -270,29 +279,25 @@ def _write_excel_report(
     issues_df: pd.DataFrame,
     evidence_frames: Dict[str, pd.DataFrame],
 ):
-
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-
         summary_df.to_excel(writer, sheet_name="summary", index=False)
         checks_df.to_excel(writer, sheet_name="checks", index=False)
         issues_df.to_excel(writer, sheet_name="issue_explanations", index=False)
 
         for name, df in evidence_frames.items():
-
             if df is None:
                 df = pd.DataFrame()
 
-            sheet = str(name)[:31]
+            df = _ensure_membership_number_column(df)
 
+            sheet = str(name)[:31]
             df.to_excel(writer, sheet_name=sheet, index=False)
 
 
 def write_reports(run: ValidationRun, out_dir: str) -> Dict[str, str]:
-
     ensure_out_dir(out_dir)
 
     checks_df = _checks_to_dataframe(run.checks)
-
     issues_df = _build_issue_explanations_df(checks_df)
 
     summary_md = os.path.join(out_dir, "summary.md")
@@ -314,12 +319,18 @@ def write_reports(run: ValidationRun, out_dir: str) -> Dict[str, str]:
     with open(summary_md, "w", encoding="utf-8") as f:
         f.write(summary_text)
 
+    normalized_evidence_frames = {}
+    for name, df in (run.dataframes or {}).items():
+        if df is None:
+            df = pd.DataFrame()
+        normalized_evidence_frames[name] = _ensure_membership_number_column(df)
+
     _write_excel_report(
         excel_path,
         summary_df,
         checks_df,
         issues_df,
-        run.dataframes or {},
+        normalized_evidence_frames,
     )
 
     evidence_paths = {
@@ -329,15 +340,9 @@ def write_reports(run: ValidationRun, out_dir: str) -> Dict[str, str]:
         "excel": excel_path,
     }
 
-    for name, df in (run.dataframes or {}).items():
-
+    for name, df in normalized_evidence_frames.items():
         path = os.path.join(out_dir, f"{name}.csv")
-
-        if df is None:
-            df = pd.DataFrame()
-
         df.to_csv(path, index=False)
-
         evidence_paths[name] = path
 
     return evidence_paths

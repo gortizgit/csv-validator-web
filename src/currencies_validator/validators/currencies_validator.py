@@ -23,6 +23,9 @@ from prices_validator.core.types import CheckResult, SnapshotContext, Validation
 
 
 class CurrenciesValidator:
+    BLANK_COUNTRY_ID = "BLANK"
+    BLANK_COUNTRY_LABEL = "[blank]"
+
     def __init__(self, snapshot_context: SnapshotContext | None = None) -> None:
         self.checks: List[CheckResult] = []
         self.evidence: Dict[str, pd.DataFrame] = {}
@@ -57,6 +60,49 @@ class CurrenciesValidator:
             )
         )
 
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+    def _approved_years(self) -> set[int]:
+        today = pd.Timestamp.today()
+        return {today.year, today.year - 1}
+
+    def _normalize_scalar(self, value: object) -> str:
+        if pd.isna(value):
+            return ""
+        text = str(value).strip()
+        return text
+
+    def _normalize_series(self, series: pd.Series) -> pd.Series:
+        return series.apply(self._normalize_scalar)
+
+    def _filter_current_last_year(self, df: pd.DataFrame) -> pd.DataFrame:
+        if KEY_DATE_COLUMN not in df.columns:
+            return df.iloc[0:0].copy()
+
+        dates = pd.to_datetime(df[KEY_DATE_COLUMN], errors="coerce")
+        allowed_years = self._approved_years()
+        mask = dates.dt.year.isin(allowed_years).fillna(False)
+        return df.loc[mask].copy()
+
+    def _country_check_id_suffix(self, country: str) -> str:
+        return country if country else self.BLANK_COUNTRY_ID
+
+    def _country_display_value(self, country: str) -> str:
+        return country if country else self.BLANK_COUNTRY_LABEL
+
+    def _build_key_set(self, df: pd.DataFrame) -> set[tuple[str, str, str]]:
+        return set(
+            zip(
+                self._normalize_series(df[KEY_DATE_COLUMN]),
+                self._normalize_series(df[KEY_WAREHOUSE_COLUMN]),
+                self._normalize_series(df[KEY_CURRENCY_COLUMN]),
+            )
+        )
+
+    # -------------------------------------------------------------------------
+    # Main
+    # -------------------------------------------------------------------------
     def validate(self, domo_df: pd.DataFrame, inf_df: pd.DataFrame) -> ValidationRun:
         print("  [1/8] Snapshot validation...")
         self._validate_snapshot(domo_df, inf_df)
@@ -447,8 +493,11 @@ class CurrenciesValidator:
             )
             return
 
-        domo_countries = sorted(set(domo_df[KEY_COUNTRY_COLUMN].dropna().astype(str).tolist()))
-        inf_countries = sorted(set(inf_df[KEY_COUNTRY_COLUMN].dropna().astype(str).tolist()))
+        domo_scope = self._filter_current_last_year(domo_df)
+        inf_scope = self._filter_current_last_year(inf_df)
+
+        domo_countries = sorted(set(self._normalize_series(domo_scope[KEY_COUNTRY_COLUMN]).tolist()))
+        inf_countries = sorted(set(self._normalize_series(inf_scope[KEY_COUNTRY_COLUMN]).tolist()))
 
         only_domo = sorted(set(domo_countries) - set(inf_countries))
         only_inf = sorted(set(inf_countries) - set(domo_countries))
@@ -456,9 +505,9 @@ class CurrenciesValidator:
         if only_domo or only_inf:
             rows = []
             for c in only_domo:
-                rows.append({"source": "DOMO_ONLY", "country": c})
+                rows.append({"source": "DOMO_ONLY", "country": self._country_display_value(c)})
             for c in only_inf:
-                rows.append({"source": "INFORMATICA_ONLY", "country": c})
+                rows.append({"source": "INFORMATICA_ONLY", "country": self._country_display_value(c)})
             self.evidence["currencies_country_presence_differences"] = pd.DataFrame(rows)
 
         self.add_check(
@@ -484,59 +533,47 @@ class CurrenciesValidator:
         country_row_diff_rows = []
         country_key_diff_rows = []
 
+        domo_country_norm = self._normalize_series(domo_scope[KEY_COUNTRY_COLUMN])
+        inf_country_norm = self._normalize_series(inf_scope[KEY_COUNTRY_COLUMN])
+
         for idx, country in enumerate(common_countries, start=1):
-            print(f"    [{idx}/{len(common_countries)}] Country {country}...")
+            display_country = self._country_display_value(country)
+            id_country = self._country_check_id_suffix(country)
 
-            domo_country = domo_df[domo_df[KEY_COUNTRY_COLUMN].astype(str) == country].copy()
-            inf_country = inf_df[inf_df[KEY_COUNTRY_COLUMN].astype(str) == country].copy()
+            print(f"    [{idx}/{len(common_countries)}] Country {display_country}...")
 
-            domo_dates = pd.to_datetime(domo_country[KEY_DATE_COLUMN], errors="coerce")
-            inf_dates = pd.to_datetime(inf_country[KEY_DATE_COLUMN], errors="coerce")
-
-            domo_filtered = domo_country.loc[domo_dates.dt.year.isin(allowed_years).fillna(False)].copy()
-            inf_filtered = inf_country.loc[inf_dates.dt.year.isin(allowed_years).fillna(False)].copy()
+            domo_country = domo_scope.loc[domo_country_norm == country].copy()
+            inf_country = inf_scope.loc[inf_country_norm == country].copy()
 
             print(
-                f"      Current+LastYear rows -> DOMO: {len(domo_filtered):,}, "
-                f"INFORMATICA: {len(inf_filtered):,}"
+                f"      Current+LastYear rows -> DOMO: {len(domo_country):,}, "
+                f"INFORMATICA: {len(inf_country):,}"
             )
 
-            row_status = "PASS" if len(domo_filtered) == len(inf_filtered) else "FAIL"
+            row_status = "PASS" if len(domo_country) == len(inf_country) else "FAIL"
             self.add_check(
-                f"CURRENCIES-{country}-ROW",
-                f"Verify Current + Last Year record count matches for country {country}",
+                f"CURRENCIES-{id_country}-ROW",
+                f"Verify Current + Last Year record count matches for country {display_country}",
                 row_status,
                 "Country Content",
-                country=country,
+                country=display_country,
                 field="All records in approved universe",
-                expected=str(len(domo_filtered)),
-                actual=str(len(inf_filtered)),
-                details=f"Compared only rows for country {country} in years {today.year - 1} and {today.year}.",
+                expected=str(len(domo_country)),
+                actual=str(len(inf_country)),
+                details=f"Compared only rows for country {display_country} in years {today.year - 1} and {today.year}.",
             )
 
             if row_status == "FAIL":
                 country_row_diff_rows.append(
                     {
-                        "country": country,
-                        "domo_rows_current_last_year": len(domo_filtered),
-                        "informatica_rows_current_last_year": len(inf_filtered),
+                        "country": display_country,
+                        "domo_rows_current_last_year": len(domo_country),
+                        "informatica_rows_current_last_year": len(inf_country),
                     }
                 )
 
-            domo_keys = set(
-                zip(
-                    domo_country[KEY_DATE_COLUMN].astype(str),
-                    domo_country[KEY_WAREHOUSE_COLUMN].astype(str),
-                    domo_country[KEY_CURRENCY_COLUMN].astype(str),
-                )
-            )
-            inf_keys = set(
-                zip(
-                    inf_country[KEY_DATE_COLUMN].astype(str),
-                    inf_country[KEY_WAREHOUSE_COLUMN].astype(str),
-                    inf_country[KEY_CURRENCY_COLUMN].astype(str),
-                )
-            )
+            domo_keys = self._build_key_set(domo_country)
+            inf_keys = self._build_key_set(inf_country)
 
             only_country_domo = sorted(domo_keys - inf_keys)
             only_country_inf = sorted(inf_keys - domo_keys)
@@ -549,35 +586,35 @@ class CurrenciesValidator:
 
             key_status = "PASS" if not only_country_domo and not only_country_inf else "FAIL"
             self.add_check(
-                f"CURRENCIES-{country}-KEY",
-                f"Verify date, warehouse, and currency population matches for country {country}",
+                f"CURRENCIES-{id_country}-KEY",
+                f"Verify date, warehouse, and currency population matches for country {display_country}",
                 key_status,
                 "Country Content",
-                country=country,
+                country=display_country,
                 field=f"{KEY_DATE_COLUMN}; {KEY_WAREHOUSE_COLUMN}; {KEY_CURRENCY_COLUMN}",
                 expected="Set equality within country",
                 actual=f"only_in_domo={len(only_country_domo)}, only_in_informatica={len(only_country_inf)}",
-                details="Country-scoped key population comparison.",
+                details="Country-scoped key population comparison within approved universe.",
             )
 
             for item in only_country_domo[:MAX_EVIDENCE_ROWS]:
                 country_key_diff_rows.append(
                     {
-                        "country": country,
+                        "country": display_country,
                         "source": "DOMO_ONLY",
                         KEY_DATE_COLUMN: item[0],
-                        KEY_WAREHOUSE_COLUMN: item[1],
-                        KEY_CURRENCY_COLUMN: item[2],
+                        KEY_WAREHOUSE_COLUMN: item[1] or self.BLANK_COUNTRY_LABEL,
+                        KEY_CURRENCY_COLUMN: item[2] or self.BLANK_COUNTRY_LABEL,
                     }
                 )
             for item in only_country_inf[:MAX_EVIDENCE_ROWS]:
                 country_key_diff_rows.append(
                     {
-                        "country": country,
+                        "country": display_country,
                         "source": "INFORMATICA_ONLY",
                         KEY_DATE_COLUMN: item[0],
-                        KEY_WAREHOUSE_COLUMN: item[1],
-                        KEY_CURRENCY_COLUMN: item[2],
+                        KEY_WAREHOUSE_COLUMN: item[1] or self.BLANK_COUNTRY_LABEL,
+                        KEY_CURRENCY_COLUMN: item[2] or self.BLANK_COUNTRY_LABEL,
                     }
                 )
 
@@ -591,6 +628,9 @@ class CurrenciesValidator:
     # Key population
     # -------------------------------------------------------------------------
     def _validate_key_population(self, domo_df: pd.DataFrame, inf_df: pd.DataFrame) -> None:
+        domo_scope = self._filter_current_last_year(domo_df)
+        inf_scope = self._filter_current_last_year(inf_df)
+
         key_cols = [
             KEY_COUNTRY_COLUMN,
             KEY_DATE_COLUMN,
@@ -601,7 +641,7 @@ class CurrenciesValidator:
         for idx, key_col in enumerate(key_cols, start=1):
             check_id = f"CURRENCIES-007{chr(96 + idx)}"
 
-            if key_col not in domo_df.columns or key_col not in inf_df.columns:
+            if key_col not in domo_scope.columns or key_col not in inf_scope.columns:
                 self.add_check(
                     check_id,
                     f"Verify that the {key_col} population matches exactly between Domo and Informatica",
@@ -613,19 +653,20 @@ class CurrenciesValidator:
                 )
                 continue
 
-            domo_vals = domo_df[key_col].tolist()
-            inf_vals = inf_df[key_col].tolist()
-
-            domo_set = set(domo_vals)
-            inf_set = set(inf_vals)
+            domo_set = set(self._normalize_series(domo_scope[key_col]).tolist())
+            inf_set = set(self._normalize_series(inf_scope[key_col]).tolist())
 
             only_domo = sorted(domo_set - inf_set)
             only_inf = sorted(inf_set - domo_set)
 
             if only_domo:
-                self.evidence[f"currencies_{key_col}_only_in_domo"] = pd.DataFrame({key_col: only_domo[:MAX_EVIDENCE_ROWS]})
+                self.evidence[f"currencies_{key_col}_only_in_domo"] = pd.DataFrame(
+                    {key_col: [v if v else self.BLANK_COUNTRY_LABEL for v in only_domo[:MAX_EVIDENCE_ROWS]]}
+                )
             if only_inf:
-                self.evidence[f"currencies_{key_col}_only_in_informatica"] = pd.DataFrame({key_col: only_inf[:MAX_EVIDENCE_ROWS]})
+                self.evidence[f"currencies_{key_col}_only_in_informatica"] = pd.DataFrame(
+                    {key_col: [v if v else self.BLANK_COUNTRY_LABEL for v in only_inf[:MAX_EVIDENCE_ROWS]]}
+                )
 
             status = "PASS" if not only_domo and not only_inf else "FAIL"
 
@@ -637,7 +678,7 @@ class CurrenciesValidator:
                 field=key_col,
                 expected="Set equality",
                 actual=f"only_in_domo={len(only_domo)}, only_in_informatica={len(only_inf)}",
-                details="See evidence files if generated.",
+                details="Compared within approved universe using normalized blank handling.",
             )
 
     # -------------------------------------------------------------------------
@@ -719,8 +760,11 @@ class CurrenciesValidator:
             int(inf_valid_dates.dt.year.isin(allowed_years).sum()) if not inf_valid_dates.empty else 0
         )
 
-        domo_country_count = int(domo_df[KEY_COUNTRY_COLUMN].dropna().astype(str).nunique()) if KEY_COUNTRY_COLUMN in domo_df.columns else 0
-        inf_country_count = int(inf_df[KEY_COUNTRY_COLUMN].dropna().astype(str).nunique()) if KEY_COUNTRY_COLUMN in inf_df.columns else 0
+        domo_scope = self._filter_current_last_year(domo_df) if KEY_COUNTRY_COLUMN in domo_df.columns else pd.DataFrame()
+        inf_scope = self._filter_current_last_year(inf_df) if KEY_COUNTRY_COLUMN in inf_df.columns else pd.DataFrame()
+
+        domo_country_count = int(self._normalize_series(domo_scope[KEY_COUNTRY_COLUMN]).nunique()) if not domo_scope.empty else 0
+        inf_country_count = int(self._normalize_series(inf_scope[KEY_COUNTRY_COLUMN]).nunique()) if not inf_scope.empty else 0
 
         return {
             "dataset": DATASET_NAME,
