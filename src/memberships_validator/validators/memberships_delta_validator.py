@@ -52,6 +52,7 @@ from memberships_validator.config.memberships_delta_config import (
     PRIMARY_ALLOWED_VALUES,
     REQUIRED_NOT_BLANK_FIELDS,
     TIMESTAMP_COLUMN,
+    TIMESTAMP_COMPARE_DATE_ONLY,
     TRANSITION_VALUE_COLUMNS,
     UPGRADE_MEMBERSHIP_TYPE_CODES,
     UPGRADE_PRICE_COLUMNS,
@@ -265,6 +266,90 @@ class MembershipsDeltaValidator:
         except (InvalidOperation, ValueError):
             return None
 
+    def _normalize_timestamp_for_compare(self, value: object) -> str:
+        raw = self._trim_value(value)
+        if not raw:
+            return ""
+
+        parsed = pd.to_datetime(raw, errors="coerce")
+        if pd.isna(parsed):
+            return raw
+
+        if TIMESTAMP_COMPARE_DATE_ONLY:
+            return parsed.date().isoformat()
+
+        return parsed.isoformat(sep=" ")
+
+    def _normalize_timestamp_series_for_grouping(self, series: pd.Series) -> pd.Series:
+        trimmed = self._trim_series(series)
+        if not TIMESTAMP_COMPARE_DATE_ONLY:
+            return trimmed
+
+        parsed = pd.to_datetime(trimmed.replace("", pd.NA), errors="coerce")
+        normalized = trimmed.copy()
+        valid_mask = parsed.notna()
+
+        if valid_mask.any():
+            normalized.loc[valid_mask] = parsed.loc[valid_mask].dt.date.astype(str)
+
+        return normalized
+
+    def _normalize_timestamp_series_for_date_only(self, series: pd.Series) -> pd.Series:
+        trimmed = self._trim_series(series)
+        parsed = pd.to_datetime(trimmed.replace("", pd.NA), errors="coerce")
+
+        normalized = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+        valid_mask = parsed.notna()
+
+        if valid_mask.any():
+            normalized.loc[valid_mask] = parsed.loc[valid_mask].dt.normalize()
+
+        return normalized
+
+    def _normalize_date_like_value(self, value: object) -> str:
+        raw = self._trim_value(value)
+        if not raw:
+            return ""
+
+        parsed = pd.to_datetime(raw, errors="coerce")
+        if pd.isna(parsed):
+            return raw
+
+        return parsed.date().isoformat()
+
+    def _build_transition_signature(self, row: Dict[str, object]) -> Tuple[str, ...]:
+        return (
+            self._trim_value(row.get("Membership_Number", "")),
+            self._trim_value(row.get("Account_Number_Full", "")),
+            self._normalize_date_like_value(row.get("effectiveDate", "")),
+            self._normalize_timestamp_for_compare(row.get(TIMESTAMP_COLUMN, "")),
+            self._trim_value(row.get("membershipTypeCode", "")),
+            self._trim_value(row.get("isPlatinumMember", "")),
+        )
+
+    def _normalize_potential_accruals_for_compare(self, value: object, source: str) -> str:
+        raw = self._trim_value(value)
+        if not raw:
+            return ""
+
+        parsed = self._to_decimal(raw)
+        if parsed is None:
+            return raw
+
+        if source.upper() == "DOMO":
+            return str(parsed.quantize(Decimal("0.01")))
+
+        return str(parsed)
+
+    def _normalize_value_for_compare(self, col: str, value: object, source: str) -> str:
+        if col == TIMESTAMP_COLUMN:
+            return self._normalize_timestamp_for_compare(value)
+
+        if col == "Potential_Accruals":
+            return self._normalize_potential_accruals_for_compare(value, source)
+
+        return self._trim_value(value)
+
     def _is_nonzero_numeric(self, value: object) -> bool:
         parsed = self._to_decimal(value)
         return parsed is not None and parsed != Decimal("0")
@@ -310,8 +395,8 @@ class MembershipsDeltaValidator:
             different_fields: List[str] = []
 
             for col in EXPECTED_COLUMNS_BASELINE:
-                domo_val = self._trim_value(domo_row.get(col, ""))
-                inf_val = self._trim_value(inf_row.get(col, ""))
+                domo_val = self._normalize_value_for_compare(col, domo_row.get(col, ""), "DOMO")
+                inf_val = self._normalize_value_for_compare(col, inf_row.get(col, ""), "INFA")
                 if domo_val != inf_val:
                     different_fields.append(col)
 
@@ -1214,51 +1299,74 @@ class MembershipsDeltaValidator:
         )
 
     def _validate_household_consistency(self, inf_df: pd.DataFrame) -> None:
-        key = "Membership_Number"
-        value_col = "Household_Accruing_Balance_Acumulated"
-
-        if key not in inf_df.columns or value_col not in inf_df.columns:
+        required = {"Membership_Number", "Household_Accruing_Balance_Acumulated"}
+        if not required.issubset(set(inf_df.columns)):
             self.add_check(
                 "MEM-DELTA-015",
                 "Validate Household Accruing Balance consistency",
                 "FAIL",
                 "Business Rule",
-                field=f"{key}; {value_col}",
+                field="Membership_Number; Household_Accruing_Balance_Acumulated",
                 expected="Columns exist",
                 actual="Missing columns",
             )
             return
 
-        issues = []
-        inconsistent = 0
-        grouped = inf_df.assign(
-            Membership_Number=self._trim_series(inf_df[key]),
-            Household_Accruing_Balance_Acumulated=self._trim_series(inf_df[value_col]),
-        ).groupby("Membership_Number")
+        work = inf_df.copy()
+        work["Membership_Number"] = self._trim_series(work["Membership_Number"])
+        work["Household_Accruing_Balance_Acumulated"] = self._trim_series(
+            work["Household_Accruing_Balance_Acumulated"]
+        )
 
-        for membership, group in grouped:
-            vals = {v for v in group[value_col].tolist() if v != ""}
+        group_columns = ["Membership_Number"]
+        uses_snapshot_grouping = False
+
+        if BOTH_FILES_ARE_CONSOLIDATED and TIMESTAMP_COLUMN in work.columns:
+            work[TIMESTAMP_COLUMN] = self._normalize_timestamp_series_for_grouping(work[TIMESTAMP_COLUMN])
+            group_columns = ["Membership_Number", TIMESTAMP_COLUMN]
+            uses_snapshot_grouping = True
+
+        issues: List[Dict[str, object]] = []
+        inconsistent = 0
+
+        for group_key, group in work.groupby(group_columns):
+            membership = group_key[0] if isinstance(group_key, tuple) else group_key
+            snapshot_value = group_key[1] if isinstance(group_key, tuple) and len(group_key) > 1 else ""
+
+            vals = {
+                v for v in group["Household_Accruing_Balance_Acumulated"].tolist()
+                if v != ""
+            }
+
             if len(vals) > 1:
                 inconsistent += 1
                 if len(issues) < MAX_EVIDENCE_ROWS:
-                    issues.append(
-                        {
-                            "Membership_Number": membership,
-                            "observed_values": ", ".join(sorted(vals)),
-                        }
-                    )
+                    record = {
+                        "Membership_Number": membership,
+                        "observed_values": ", ".join(sorted(vals)),
+                    }
+                    if uses_snapshot_grouping:
+                        record[TIMESTAMP_COLUMN] = snapshot_value
+                    issues.append(record)
 
         if issues:
             self.evidence["memberships_delta_household_internal_consistency"] = pd.DataFrame(issues)
+
+        details = (
+            "For consolidated files, this validation is executed by Membership_Number + Timestamp_Run to avoid false inconsistencies across different runs inside the same consolidated window."
+            if uses_snapshot_grouping
+            else "Validation is executed by Membership_Number."
+        )
 
         self.add_check(
             "MEM-DELTA-015",
             "Validate Household Accruing Balance consistency",
             "PASS" if inconsistent == 0 else "FAIL",
             "Business Rule",
-            field=f"{key}; {value_col}",
-            expected="A Membership_Number must not have conflicting household balance values in the same file",
-            actual=f"Inconsistent memberships={inconsistent}",
+            field="Membership_Number; Household_Accruing_Balance_Acumulated",
+            expected="A validation group must not have conflicting household balance values",
+            actual=f"Inconsistent groups={inconsistent}",
+            details=details,
             evidence_file="memberships_delta_household_internal_consistency.csv" if inconsistent > 0 else "",
         )
 
@@ -1276,30 +1384,49 @@ class MembershipsDeltaValidator:
             )
             return
 
-        issues = []
-        inconsistent = 0
-        grouped = inf_df.assign(
-            Membership_Number=self._trim_series(inf_df["Membership_Number"]),
-            primary=self._trim_series(inf_df["primary"]).str.upper(),
-            cardStatusCode=self._trim_series(inf_df["cardStatusCode"]),
-        ).groupby("Membership_Number")
+        work = inf_df.copy()
+        work["Membership_Number"] = self._trim_series(work["Membership_Number"])
+        work["primary"] = self._trim_series(work["primary"]).str.upper()
+        work["cardStatusCode"] = self._trim_series(work["cardStatusCode"])
 
-        for membership, group in grouped:
+        group_columns = ["Membership_Number"]
+        uses_snapshot_grouping = False
+
+        if BOTH_FILES_ARE_CONSOLIDATED and TIMESTAMP_COLUMN in work.columns:
+            work[TIMESTAMP_COLUMN] = self._normalize_timestamp_series_for_grouping(work[TIMESTAMP_COLUMN])
+            group_columns = ["Membership_Number", TIMESTAMP_COLUMN]
+            uses_snapshot_grouping = True
+
+        issues: List[Dict[str, object]] = []
+        inconsistent = 0
+
+        for group_key, group in work.groupby(group_columns):
+            membership = group_key[0] if isinstance(group_key, tuple) else group_key
+            snapshot_value = group_key[1] if isinstance(group_key, tuple) and len(group_key) > 1 else ""
+
             active_primary_count = len(
                 group[(group["primary"] == "Y") & (group["cardStatusCode"].isin(ACTIVE_CARD_STATUS_CODES))]
             )
+
             if active_primary_count != 1:
                 inconsistent += 1
                 if len(issues) < MAX_EVIDENCE_ROWS:
-                    issues.append(
-                        {
-                            "Membership_Number": membership,
-                            "active_primary_count": active_primary_count,
-                        }
-                    )
+                    record = {
+                        "Membership_Number": membership,
+                        "active_primary_count": active_primary_count,
+                    }
+                    if uses_snapshot_grouping:
+                        record[TIMESTAMP_COLUMN] = snapshot_value
+                    issues.append(record)
 
         if issues:
             self.evidence["memberships_delta_primary_consistency"] = pd.DataFrame(issues)
+
+        details = (
+            "For consolidated files, this validation is executed by Membership_Number + Timestamp_Run to avoid false inconsistencies across different runs inside the same consolidated window."
+            if uses_snapshot_grouping
+            else "Validation is executed by Membership_Number."
+        )
 
         self.add_check(
             "MEM-DELTA-016",
@@ -1307,8 +1434,9 @@ class MembershipsDeltaValidator:
             "PASS" if inconsistent == 0 else "FAIL",
             "Business Rule",
             field="Membership_Number; Account_Number_Full; primary",
-            expected="Exactly one active primary card per Membership_Number",
-            actual=f"Inconsistent memberships={inconsistent}",
+            expected="Exactly one active primary card per validation group",
+            actual=f"Inconsistent groups={inconsistent}",
+            details=details,
             evidence_file="memberships_delta_primary_consistency.csv" if inconsistent > 0 else "",
         )
 
@@ -1326,28 +1454,46 @@ class MembershipsDeltaValidator:
             )
             return
 
-        issues = []
-        inconsistent = 0
-        grouped = inf_df.assign(
-            Membership_Number=self._trim_series(inf_df["Membership_Number"]),
-            accountStatusCode=self._trim_series(inf_df["accountStatusCode"]),
-            membershipTypeCode=self._trim_series(inf_df["membershipTypeCode"]),
-        ).groupby("Membership_Number")
+        work = inf_df.copy()
+        work["Membership_Number"] = self._trim_series(work["Membership_Number"])
+        work["accountStatusCode"] = self._trim_series(work["accountStatusCode"])
+        work["membershipTypeCode"] = self._trim_series(work["membershipTypeCode"])
 
-        for membership, group in grouped:
+        group_columns = ["Membership_Number"]
+        uses_snapshot_grouping = False
+
+        if BOTH_FILES_ARE_CONSOLIDATED and TIMESTAMP_COLUMN in work.columns:
+            work[TIMESTAMP_COLUMN] = self._normalize_timestamp_series_for_grouping(work[TIMESTAMP_COLUMN])
+            group_columns = ["Membership_Number", TIMESTAMP_COLUMN]
+            uses_snapshot_grouping = True
+
+        issues: List[Dict[str, object]] = []
+        inconsistent = 0
+
+        for group_key, group in work.groupby(group_columns):
+            membership = group_key[0] if isinstance(group_key, tuple) else group_key
+            snapshot_value = group_key[1] if isinstance(group_key, tuple) and len(group_key) > 1 else ""
+
             statuses = {v for v in group["accountStatusCode"].tolist() if v != ""}
             if len(statuses) > 1:
                 inconsistent += 1
                 if len(issues) < MAX_EVIDENCE_ROWS:
-                    issues.append(
-                        {
-                            "Membership_Number": membership,
-                            "account_statuses": ", ".join(sorted(statuses)),
-                        }
-                    )
+                    record = {
+                        "Membership_Number": membership,
+                        "account_statuses": ", ".join(sorted(statuses)),
+                    }
+                    if uses_snapshot_grouping:
+                        record[TIMESTAMP_COLUMN] = snapshot_value
+                    issues.append(record)
 
         if issues:
             self.evidence["memberships_delta_inactive_account_consistency"] = pd.DataFrame(issues)
+
+        details = (
+            "For consolidated files, this validation is executed by Membership_Number + Timestamp_Run to avoid false inconsistencies across different runs inside the same consolidated window."
+            if uses_snapshot_grouping
+            else "Validation is executed by Membership_Number."
+        )
 
         self.add_check(
             "MEM-DELTA-017",
@@ -1355,8 +1501,9 @@ class MembershipsDeltaValidator:
             "PASS" if inconsistent == 0 else "FAIL",
             "Business Rule",
             field="Membership_Number; accountStatusCode; membershipTypeCode",
-            expected="A Membership_Number should not carry conflicting accountStatusCode values in the same file",
-            actual=f"Inconsistent memberships={inconsistent}",
+            expected="A validation group should not carry conflicting accountStatusCode values",
+            actual=f"Inconsistent groups={inconsistent}",
+            details=details,
             evidence_file="memberships_delta_inactive_account_consistency.csv" if inconsistent > 0 else "",
         )
 
@@ -1473,7 +1620,7 @@ class MembershipsDeltaValidator:
         uses_snapshot_grouping = False
 
         if BOTH_FILES_ARE_CONSOLIDATED and TIMESTAMP_COLUMN in work.columns:
-            work[TIMESTAMP_COLUMN] = self._trim_series(work[TIMESTAMP_COLUMN])
+            work[TIMESTAMP_COLUMN] = self._normalize_timestamp_series_for_grouping(work[TIMESTAMP_COLUMN])
             group_columns = ["Membership_Number", TIMESTAMP_COLUMN]
             uses_snapshot_grouping = True
 
@@ -1592,6 +1739,26 @@ class MembershipsDeltaValidator:
             )
             return
 
+        if TIMESTAMP_COMPARE_DATE_ONLY:
+            domo_min = domo_ts.min().date().isoformat()
+            domo_max = domo_ts.max().date().isoformat()
+            inf_min = inf_ts.min().date().isoformat()
+            inf_max = inf_ts.max().date().isoformat()
+
+            same_effective_date = domo_max == inf_max
+
+            self.add_check(
+                "MEM-DELTA-009",
+                "Validate Domo and Informatica timestamp consistency",
+                "PASS" if same_effective_date else "FAIL",
+                "Quality",
+                field=TIMESTAMP_COLUMN,
+                expected=f"{domo_min} -> {domo_max}",
+                actual=f"{inf_min} -> {inf_max}",
+                details="Timestamp validation is configured to compare only the date portion and ignore the time component.",
+            )
+            return
+
         domo_spread = (domo_ts.max() - domo_ts.min()).total_seconds() / 60.0
         inf_spread = (inf_ts.max() - inf_ts.min()).total_seconds() / 60.0
         expected_window = self._effective_window_minutes()
@@ -1663,6 +1830,72 @@ class MembershipsDeltaValidator:
                 field=TIMESTAMP_COLUMN,
                 expected="Timestamp column exists in both files",
                 actual="Missing in one or both files",
+            )
+            return
+
+        if TIMESTAMP_COMPARE_DATE_ONLY:
+            domo_ts = self._normalize_timestamp_series_for_date_only(domo_df[TIMESTAMP_COLUMN])
+            inf_ts = self._normalize_timestamp_series_for_date_only(inf_df[TIMESTAMP_COLUMN])
+
+            domo_snapshot_date = pd.Timestamp(domo_snapshot.date())
+            inf_snapshot_date = pd.Timestamp(inf_snapshot.date())
+
+            domo_mask = domo_ts.eq(domo_snapshot_date).fillna(False)
+            inf_mask = inf_ts.eq(inf_snapshot_date).fillna(False)
+
+            domo_outside = domo_df.loc[~domo_mask].copy()
+            inf_outside = inf_df.loc[~inf_mask].copy()
+
+            if not domo_outside.empty:
+                self.evidence["memberships_delta_domo_outside_window"] = domo_outside.head(MAX_EVIDENCE_ROWS)
+            if not inf_outside.empty:
+                self.evidence["memberships_delta_infa_outside_window"] = inf_outside.head(MAX_EVIDENCE_ROWS)
+
+            self.add_check(
+                "MEM-DELTA-009B",
+                "Verify Delta contains only memberships changed within the configured production window",
+                "PASS" if domo_outside.empty and inf_outside.empty else "FAIL",
+                "Delta Logic",
+                field=TIMESTAMP_COLUMN,
+                expected=(
+                    f"All rows must match snapshot date only. "
+                    f"Domo date: {domo_snapshot_date.date().isoformat()}; "
+                    f"Informatica date: {inf_snapshot_date.date().isoformat()}"
+                ),
+                actual=(
+                    f"Domo rows outside date={len(domo_outside)} | "
+                    f"Informatica rows outside date={len(inf_outside)}"
+                ),
+                details="Timestamp_Run validation is configured to compare only the date portion and ignore the time component.",
+                evidence_file=(
+                    "memberships_delta_domo_outside_window.csv"
+                    if not domo_outside.empty
+                    else ("memberships_delta_infa_outside_window.csv" if not inf_outside.empty else "")
+                ),
+            )
+
+            if BOTH_FILES_ARE_CONSOLIDATED:
+                status = "PASS" if domo_snapshot_date == inf_snapshot_date else "FAIL"
+                details = "Both files are consolidated and Timestamp_Run is configured to validate only the snapshot date."
+            elif DOMO_IS_CONSOLIDATED:
+                status = "WARNING"
+                details = (
+                    "Domo is treated as a consolidated file, so exact snapshot date equality remains informational "
+                    "when comparing different documented runs in Delta mode."
+                )
+            else:
+                status = "PASS" if domo_snapshot_date == inf_snapshot_date else "FAIL"
+                details = "Timestamp_Run is configured to validate only the date portion of the documented snapshot."
+
+            self.add_check(
+                "MEM-DELTA-009C",
+                "Verify Domo and Informatica use the same effective Delta window",
+                status,
+                "File Control",
+                field="Snapshot / delta window",
+                expected=domo_snapshot_date.date().isoformat(),
+                actual=inf_snapshot_date.date().isoformat(),
+                details=details,
             )
             return
 
@@ -1772,6 +2005,20 @@ class MembershipsDeltaValidator:
                 )
                 continue
 
+            if TIMESTAMP_COMPARE_DATE_ONLY:
+                spread_days = (ts.max().date() - ts.min().date()).days
+                self.add_check(
+                    check_id,
+                    f"Verify that the {source_name} file can support the approved production cadence",
+                    "PASS" if spread_days <= 1 else "FAIL",
+                    "Delta Logic",
+                    field=TIMESTAMP_COLUMN,
+                    expected="Timestamp date spread <= 1 day",
+                    actual=f"Observed date spread={spread_days} day(s)",
+                    details="Cadence validation is configured to evaluate only the date portion of Timestamp_Run and ignore the time component.",
+                )
+                continue
+
             spread_minutes = (ts.max() - ts.min()).total_seconds() / 60.0
             self.add_check(
                 check_id,
@@ -1828,7 +2075,7 @@ class MembershipsDeltaValidator:
         )
 
     def _validate_transition_presence_and_values(self, domo_df: pd.DataFrame, inf_df: pd.DataFrame) -> None:
-        needed = {"Membership_Number", "membershipTypeCode", "isPlatinumMember", "effectiveDate", "Timestamp_Run"}
+        needed = {"Membership_Number", "Account_Number_Full", "membershipTypeCode", "isPlatinumMember", "effectiveDate", "Timestamp_Run"}
         if not needed.issubset(set(domo_df.columns)) or not needed.issubset(set(inf_df.columns)):
             self.add_check(
                 "MEM-DELTA-022",
@@ -1895,9 +2142,6 @@ class MembershipsDeltaValidator:
             )
             return
 
-        domo_index = self._build_index(domo_df, KEY_COLUMNS_PRIMARY)
-        inf_index = self._build_index(inf_df, KEY_COLUMNS_PRIMARY)
-
         def is_downgrade_candidate(row: Dict[str, object]) -> bool:
             return (
                 self._trim_value(row.get("membershipTypeCode", "")) in DOWNGRADE_MEMBERSHIP_TYPE_CODES
@@ -1911,23 +2155,59 @@ class MembershipsDeltaValidator:
                 and any(self._is_nonzero_numeric(row.get(col, "")) for col in UPGRADE_PRICE_COLUMNS)
             )
 
-        domo_downgrade_keys = {k for k, r in domo_index.items() if is_downgrade_candidate(r)}
-        inf_downgrade_keys = {k for k, r in inf_index.items() if is_downgrade_candidate(r)}
+        def collect_transition_rows(df: pd.DataFrame, predicate) -> Dict[Tuple[str, ...], Dict[str, object]]:
+            collected: Dict[Tuple[str, ...], Dict[str, object]] = {}
+            for row in df.to_dict(orient="records"):
+                if not predicate(row):
+                    continue
+                signature = self._build_transition_signature(row)
+                if signature not in collected:
+                    collected[signature] = row
+            return collected
 
-        domo_upgrade_keys = {k for k, r in domo_index.items() if is_upgrade_candidate(r)}
-        inf_upgrade_keys = {k for k, r in inf_index.items() if is_upgrade_candidate(r)}
+        domo_downgrade_rows = collect_transition_rows(domo_df, is_downgrade_candidate)
+        inf_downgrade_rows = collect_transition_rows(inf_df, is_downgrade_candidate)
+
+        domo_upgrade_rows = collect_transition_rows(domo_df, is_upgrade_candidate)
+        inf_upgrade_rows = collect_transition_rows(inf_df, is_upgrade_candidate)
+
+        domo_downgrade_keys = set(domo_downgrade_rows.keys())
+        inf_downgrade_keys = set(inf_downgrade_rows.keys())
+
+        domo_upgrade_keys = set(domo_upgrade_rows.keys())
+        inf_upgrade_keys = set(inf_upgrade_rows.keys())
 
         downgrade_missing = sorted(domo_downgrade_keys - inf_downgrade_keys)
         upgrade_missing = sorted(domo_upgrade_keys - inf_upgrade_keys)
 
         if downgrade_missing:
             self.evidence["memberships_delta_downgrade_missing"] = pd.DataFrame(
-                [{"Membership_Number": k[0], "Account_Number_Full": k[1]} for k in downgrade_missing[:MAX_EVIDENCE_ROWS]]
+                [
+                    {
+                        "Membership_Number": key[0],
+                        "Account_Number_Full": key[1],
+                        "effectiveDate": key[2],
+                        "Timestamp_Run": key[3],
+                        "membershipTypeCode": key[4],
+                        "isPlatinumMember": key[5],
+                    }
+                    for key in downgrade_missing[:MAX_EVIDENCE_ROWS]
+                ]
             )
 
         if upgrade_missing:
             self.evidence["memberships_delta_upgrade_missing"] = pd.DataFrame(
-                [{"Membership_Number": k[0], "Account_Number_Full": k[1]} for k in upgrade_missing[:MAX_EVIDENCE_ROWS]]
+                [
+                    {
+                        "Membership_Number": key[0],
+                        "Account_Number_Full": key[1],
+                        "effectiveDate": key[2],
+                        "Timestamp_Run": key[3],
+                        "membershipTypeCode": key[4],
+                        "isPlatinumMember": key[5],
+                    }
+                    for key in upgrade_missing[:MAX_EVIDENCE_ROWS]
+                ]
             )
 
         self.add_check(
@@ -1952,16 +2232,21 @@ class MembershipsDeltaValidator:
             evidence_file="memberships_delta_upgrade_missing.csv" if upgrade_missing else "",
         )
 
-        transition_common = sorted((domo_downgrade_keys | domo_upgrade_keys) & set(inf_index.keys()))
+        transition_common = sorted((domo_downgrade_keys | domo_upgrade_keys) & (set(inf_downgrade_rows.keys()) | set(inf_upgrade_rows.keys())))
         transition_mismatch = 0
         transition_records: List[Dict[str, object]] = []
 
         for key in transition_common:
-            domo_row = domo_index[key]
-            inf_row = inf_index[key]
+            domo_row = domo_downgrade_rows.get(key) or domo_upgrade_rows.get(key)
+            inf_row = inf_downgrade_rows.get(key) or inf_upgrade_rows.get(key)
+            if domo_row is None or inf_row is None:
+                continue
+
             diffs = []
             for col in TRANSITION_VALUE_COLUMNS:
-                if self._trim_value(domo_row.get(col, "")) != self._trim_value(inf_row.get(col, "")):
+                domo_val = self._normalize_value_for_compare(col, domo_row.get(col, ""), "DOMO")
+                inf_val = self._normalize_value_for_compare(col, inf_row.get(col, ""), "INFA")
+                if domo_val != inf_val:
                     diffs.append(col)
             if diffs:
                 transition_mismatch += 1
@@ -1970,6 +2255,8 @@ class MembershipsDeltaValidator:
                         {
                             "Membership_Number": key[0],
                             "Account_Number_Full": key[1],
+                            "effectiveDate": key[2],
+                            "Timestamp_Run": key[3],
                             "different_fields": ", ".join(diffs),
                         }
                     )

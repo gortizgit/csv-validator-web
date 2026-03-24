@@ -240,6 +240,7 @@ BOOLEAN_LIKE_COLUMNS = [
 ]
 
 TIMESTAMP_COLUMN = "Timestamp_Run"
+TIMESTAMP_COMPARE_DATE_ONLY = True
 
 REQUIRED_NOT_BLANK_FIELDS = [
     "Membership_Number",
@@ -263,22 +264,30 @@ REQUIRED_NOT_BLANK_FIELDS = [
 DISALLOWED_SPECIAL_CHARACTERS = {"\\"}
 
 ACCOUNT_STATUS_ALLOWED = {
+    "0",
     "00",
+    "51",
+    "57",
     "59",
     "62",
+    "63",
     "64",
 }
 
 CARD_STATUS_ALLOWED = {
+    "0",
     "00",
+    "51",
     "56",
+    "57",
     "59",
     "62",
+    "63",
     "64",
 }
 
-ACTIVE_ACCOUNT_STATUS_CODES = {"00"}
-ACTIVE_CARD_STATUS_CODES = {"00", "0"}
+ACTIVE_ACCOUNT_STATUS_CODES = {"0", "00"}
+ACTIVE_CARD_STATUS_CODES = {"0", "00"}
 
 PRIMARY_ALLOWED_VALUES = {"Y", "N"}
 PLATINUM_ALLOWED_VALUES = {"0", "1"}

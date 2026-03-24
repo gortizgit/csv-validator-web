@@ -72,7 +72,24 @@ def _ensure_membership_number_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ✅ FIX AQUI — country se convierte antes de escribir reportes
+def _make_unique_sheet_name(name: str, used_names: set[str]) -> str:
+    base = str(name).strip() or "sheet"
+    base = base[:31]
+
+    if base not in used_names:
+        used_names.add(base)
+        return base
+
+    counter = 1
+    while True:
+        suffix = f"_{counter}"
+        candidate = f"{base[:31 - len(suffix)]}{suffix}"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        counter += 1
+
+
 def _checks_to_dataframe(checks: List[CheckResult]) -> pd.DataFrame:
     rows = []
 
@@ -279,10 +296,26 @@ def _write_excel_report(
     issues_df: pd.DataFrame,
     evidence_frames: Dict[str, pd.DataFrame],
 ):
+    used_sheet_names: set[str] = set()
+
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="summary", index=False)
-        checks_df.to_excel(writer, sheet_name="checks", index=False)
-        issues_df.to_excel(writer, sheet_name="issue_explanations", index=False)
+        summary_df.to_excel(
+            writer,
+            sheet_name=_make_unique_sheet_name("summary", used_sheet_names),
+            index=False,
+        )
+
+        checks_df.to_excel(
+            writer,
+            sheet_name=_make_unique_sheet_name("checks", used_sheet_names),
+            index=False,
+        )
+
+        issues_df.to_excel(
+            writer,
+            sheet_name=_make_unique_sheet_name("issue_explanations", used_sheet_names),
+            index=False,
+        )
 
         for name, df in evidence_frames.items():
             if df is None:
@@ -290,8 +323,11 @@ def _write_excel_report(
 
             df = _ensure_membership_number_column(df)
 
-            sheet = str(name)[:31]
-            df.to_excel(writer, sheet_name=sheet, index=False)
+            df.to_excel(
+                writer,
+                sheet_name=_make_unique_sheet_name(name, used_sheet_names),
+                index=False,
+            )
 
 
 def write_reports(run: ValidationRun, out_dir: str) -> Dict[str, str]:
